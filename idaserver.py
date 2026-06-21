@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
-IDA Pro 7.7+ MCP Server — ULTIMATE EDITION (FIXED)
+IDA Pro 7.7+ MCP Server — ULTIMATE EDITION (WITH SCRIPT EXECUTION)
 Compatible: IDA 7.7+, Python 3.8+
 Transport: HTTP on 127.0.0.1:18850
+
+HOW TO RUN IN IDA PRO 7.7:
+1. Save this file as 'ida_mcp_server.py'
+2. In IDA, go to File -> Script file... and select this file.
+   OR
+3. Paste the following one-liner into the IDA Python console (Shift+F2):
+   
+   exec(open(r"C:\Path\To\ida_mcp_server.py").read())
+
 Features: 
+  - ADVANCED: Execute Arbitrary Python Scripts & Capture Output
   - Advanced Multi-Method String Search (ASCII/Unicode/Builtin)
   - Full Activity Logging to IDA Console
   - Advanced Instruction Dumping & Duplication Detection
   - Function Renaming & Advanced XREF Scanning
   - Complete Unfiltered Data Return
-Usage: exec(__import__('urllib.request').request.urlopen('RAW_GITHUB_URL').read().decode())
 """
 
 import json, threading, sys, traceback, time, io, math, hashlib
@@ -984,6 +993,64 @@ def search_full(pattern, search_type="bytes"):
         return data
     return _safe_read(_impl)
 
+# ==============================================================================
+# >>> NEW: ARBITRARY SCRIPT EXECUTION <<<
+# ==============================================================================
+
+def execute_script(code, timeout_ms=30000):
+    """
+    Execute arbitrary Python code inside IDA and capture output/results.
+    Runs synchronously on IDA's main thread to prevent crashes.
+    """
+    def _impl():
+        _log(f"Executing user script ({len(code)} chars)...")
+        result = {
+            "_source": "execute_script",
+            "stdout": "",
+            "stderr": "",
+            "return_value": None,
+            "success": False
+        }
+        
+        # Capture stdout/stderr
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        captured_out, captured_err = io.StringIO(), io.StringIO()
+        sys.stdout, sys.stderr = captured_out, captured_err
+        
+        local_ns = {
+            'idaapi': idaapi, 'idc': idc, 'idautils': idautils,
+            'ida_bytes': ida_bytes, 'ida_funcs': ida_funcs,
+            'ida_segment': ida_segment, 'ida_name': ida_name,
+            'ida_xref': ida_xref, 'ida_search': ida_search,
+            'ida_ua': ida_ua, 'ida_nalt': ida_nalt,
+            'ida_hexrays': ida_hexrays if _has_decompiler else None,
+            'result': None # Pre-define result variable
+        }
+        
+        try:
+            # Try eval first (for expressions), fall back to exec
+            try:
+                ret = eval(code, {}, local_ns)
+                result["return_value"] = ret
+            except SyntaxError:
+                exec(code, {}, local_ns)
+                # If exec was used, look for a 'result' variable set by the user
+                result["return_value"] = local_ns.get('result', None)
+            
+            result["success"] = True
+        except Exception as e:
+            result["stderr"] += f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+            result["stdout"] = captured_out.getvalue()
+            result["stderr"] += captured_err.getvalue()
+        
+        _log(f"Script execution finished. Success={result['success']}")
+        return result
+    
+    # MFF_WRITE allows the script to modify the database if needed
+    return _run_on_main(_impl, mode=idaapi.MFF_WRITE)
+
 # ===== TOOL REGISTRY =====
 TOOL_MAP = {
     "ida_preflight": {"fn": lambda a: preflight(), "schema": {"type": "object", "properties": {}, "required": []}},
@@ -1002,6 +1069,28 @@ TOOL_MAP = {
     "ida_advanced_xref_scan": {"fn": lambda a: advanced_xref_scan(a.get("address"), a.get("scan_depth", 1), a.get("include_data", True), a.get("include_code", True)), "schema": {"type": "object", "properties": {"address": {"type": "string"}, "scan_depth": {"type": "integer"}, "include_data": {"type": "boolean"}, "include_code": {"type": "boolean"}}, "required": []}},
     "ida_find_xref_chains": {"fn": lambda a: find_xref_chains(a.get("target_address"), a.get("max_chains", 50)), "schema": {"type": "object", "properties": {"target_address": {"type": "string"}, "max_chains": {"type": "integer"}}, "required": []}},
     "ida_analyze_operand_xrefs": {"fn": lambda a: analyze_operand_xrefs(a.get("address"), a.get("operand_index", 0)), "schema": {"type": "object", "properties": {"address": {"type": "string"}, "operand_index": {"type": "integer"}}, "required": []}},
+
+    # --- SCRIPT EXECUTION ---
+    "ida_execute_script": {
+        "fn": lambda a: execute_script(
+            a.get("code", ""),
+            a.get("timeout_ms", 30000)
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute inside IDA. Use `result = ...` to return a value."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Max execution time in milliseconds (default: 30000)"
+                }
+            },
+            "required": ["code"]
+        }
+    },
 
     # --- EXISTING TOOLS ---
     "ida_xrefs_to": {"fn": lambda a: xrefs_to(a.get("address")), "schema": {"type": "object", "properties": {"address": {"type": "string"}}, "required": []}},
