@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-IDA Pro 7.7 XREF + Decompile MCP Server — FULL DATA RETURN
+IDA Pro 7.7+ MCP Server — ULTIMATE EDITION (FIXED)
 Compatible: IDA 7.7+, Python 3.8+
 Transport: HTTP on 127.0.0.1:18850
-Mode: Returns complete, unfiltered raw data from all IDA APIs
-License: MIT / Internal Use
-Author: Generated for MCP Remote Execution
+Features: 
+  - Advanced Multi-Method String Search (ASCII/Unicode/Builtin)
+  - Full Activity Logging to IDA Console
+  - Advanced Instruction Dumping & Duplication Detection
+  - Function Renaming & Advanced XREF Scanning
+  - Complete Unfiltered Data Return
+Usage: exec(__import__('urllib.request').request.urlopen('RAW_GITHUB_URL').read().decode())
 """
 
-import json, threading, sys, traceback, time, io, math
+import json, threading, sys, traceback, time, io, math, hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import socketserver
@@ -19,6 +23,7 @@ import idaapi, idautils, idc
 import ida_bytes, ida_segment, ida_name, ida_xref
 import ida_funcs, ida_search, ida_auto, ida_nalt
 import ida_ida, ida_typeinf, ida_kernwin, ida_struct
+import ida_ua
 
 # Hex-Rays Decompiler (optional)
 _has_decompiler = False
@@ -27,6 +32,17 @@ try:
     _has_decompiler = ida_hexrays.init_hexrays_plugin()
 except Exception:
     pass
+
+# ===== GLOBAL LOGGER =====
+def _log(msg):
+    """Log message to IDA Output Window and Stderr"""
+    timestamp = time.strftime("%H:%M:%S")
+    formatted_msg = f"[MCP-SERVER] [{timestamp}] {msg}"
+    try:
+        idaapi.msg(formatted_msg + "\n")
+    except:
+        pass
+    print(formatted_msg, file=sys.stderr)
 
 # ===== IDA API COMPATIBILITY =====
 def _get_inf():
@@ -48,7 +64,8 @@ def _resolve_address(address):
     if isinstance(address, int): return address
     if not address: return idaapi.BADADDR
     addr_str = str(address).strip()
-    ea = ida_name.get_name_ea(idaapi.BADADDR, addr_str)
+    # Use idc for better script compatibility
+    ea = idc.get_name_ea_simple(addr_str)
     if ea != idaapi.BADADDR: return ea
     try: return int(addr_str.replace("0x","").replace("0X",""), 16)
     except: 
@@ -58,9 +75,14 @@ def _resolve_address(address):
 def _run_on_main(func, *args, mode=idaapi.MFF_READ, **kwargs):
     result = {"val": None, "err": None}
     def _wrap():
-        try: result["val"] = func(*args, **kwargs)
+        try: 
+            _log(f"Executing: {func.__name__}")
+            result["val"] = func(*args, **kwargs)
+            _log(f"Completed: {func.__name__}")
         except Exception as e:
-            result["err"] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            err_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+            result["err"] = err_msg
+            _log(f"ERROR in {func.__name__}: {err_msg}")
     if idaapi.is_main_thread(): _wrap()
     else: idaapi.execute_sync(_wrap, mode)
     if result["err"]: return {"_error": result["err"], "_partial": True}
@@ -71,6 +93,8 @@ def _safe_write(fn, *a, **kw): return _run_on_main(fn, *a, mode=idaapi.MFF_WRITE
 
 def _get_disasm(ea):
     try:
+        if not ida_bytes.is_code(idaapi.get_flags(ea)):
+            return ""
         line = idaapi.generate_disasm_line(ea, idaapi.GENDSM_FORCE_CODE)
         return idaapi.tag_remove(line) if line else ""
     except: 
@@ -92,6 +116,7 @@ def _entropy(data):
 # ===== CORE TOOLS =====
 def preflight():
     def _impl():
+        _log("Running preflight check...")
         data = {
             "_source": "preflight", "_timestamp": time.time(),
             "ida_version": idaapi.get_kernel_version(),
@@ -101,7 +126,7 @@ def preflight():
             "auto_ok": idaapi.auto_is_ok(),
             "auto_qty": idaapi.get_auto_qty() if hasattr(idaapi, 'get_auto_qty') else None,
             "decompiler_available": _has_decompiler,
-            "processor": getattr(_get_inf(), 'procName', getattr(_get_inf(), 'procname', 'unknown')) if _get_inf() else 'unknown',
+            "processor": getattr(_get_inf(), 'procname', 'unknown') if _get_inf() else 'unknown',
             "is_64bit": _is_64bit(), "ptr_size": PTR_SIZE,
             "imagebase": hex(getattr(_get_inf(), 'imagebase', 0)) if _get_inf() else None,
         }
@@ -120,6 +145,7 @@ def preflight():
 
 def decompile(address):
     def _impl():
+        _log(f"Decompiling address: {address}")
         data = {"_source": "decompile", "_address_input": address}
         if not _has_decompiler:
             data["_decompiler_status"] = "not_available"
@@ -155,8 +181,457 @@ def decompile(address):
         return data
     return _safe_read(_impl)
 
+# ==============================================================================
+# >>> NEW: ADVANCED STRING SEARCH (MULTI-METHOD) <<<
+# ==============================================================================
+
+def advanced_string_search(min_len=4, search_ascii=True, search_unicode=True, search_cstrings=True):
+    """
+    Finds strings using multiple methods:
+    1. IDA's built-in string table (fastest)
+    2. Manual byte scanning for ASCII/Unicode patterns
+    3. C-string termination detection
+    """
+    def _impl():
+        _log(f"Starting advanced string search (min_len={min_len})...")
+        results = []
+        seen_addrs = set()
+
+        # Method 1: IDA Built-in Strings
+        if search_cstrings:
+            _log("Scanning IDA string table...")
+            for s in idautils.Strings():
+                if s.length >= min_len and s.ea not in seen_addrs:
+                    seen_addrs.add(s.ea)
+                    results.append({
+                        "addr": hex(s.ea),
+                        "value": str(s),
+                        "length": s.length,
+                        "type": "ida_builtin",
+                        "str_type": s.strtype, # Fixed: was s.type
+                        "func": idc.get_func_name(s.ea) if ida_funcs.get_func(s.ea) else None
+                    })
+
+        # Method 2: Manual Byte Scanning (for hidden/unrecognized strings)
+        if search_ascii or search_unicode:
+            _log("Scanning binary segments for raw patterns...")
+            for seg_ea in idautils.Segments():
+                seg = ida_segment.getseg(seg_ea)
+                if not seg: continue
+                # Skip non-readable segments
+                if not (seg.perm & ida_segment.SEGPERM_READ): continue
+                
+                curr_ea = seg.start_ea
+                end_ea = seg.end_ea
+                
+                while curr_ea < end_ea:
+                    # Check for ASCII
+                    if search_ascii and curr_ea not in seen_addrs:
+                        b = ida_bytes.get_byte(curr_ea)
+                        if 32 <= b <= 126:
+                            # Potential start of ASCII string
+                            str_buf = bytearray()
+                            scan_ea = curr_ea
+                            while scan_ea < end_ea:
+                                cb = ida_bytes.get_byte(scan_ea)
+                                if 32 <= cb <= 126:
+                                    str_buf.append(cb)
+                                    scan_ea += 1
+                                elif cb == 0: # Null terminator
+                                    break
+                                else:
+                                    break
+                            
+                            if len(str_buf) >= min_len:
+                                seen_addrs.add(curr_ea)
+                                results.append({
+                                    "addr": hex(curr_ea),
+                                    "value": str_buf.decode('ascii', errors='ignore'),
+                                    "length": len(str_buf),
+                                    "type": "raw_ascii_scan",
+                                    "func": idc.get_func_name(curr_ea) if ida_funcs.get_func(curr_ea) else None
+                                })
+                                curr_ea = scan_ea # Skip ahead
+                                continue
+
+                    # Check for Unicode (UTF-16 LE)
+                    if search_unicode and curr_ea + 1 < end_ea and curr_ea not in seen_addrs:
+                        w = ida_bytes.get_word(curr_ea)
+                        if 32 <= (w & 0xFF) <= 126 and (w >> 8) == 0:
+                            str_buf = bytearray()
+                            scan_ea = curr_ea
+                            valid_unicode = True
+                            while scan_ea + 1 < end_ea:
+                                cw = ida_bytes.get_word(scan_ea)
+                                char_val = cw & 0xFF
+                                null_high = (cw >> 8) == 0
+                                
+                                if 32 <= char_val <= 126 and null_high:
+                                    str_buf.append(char_val)
+                                    scan_ea += 2
+                                elif cw == 0: # Null terminator
+                                    break
+                                else:
+                                    valid_unicode = False
+                                    break
+                            
+                            if valid_unicode and len(str_buf) >= min_len:
+                                seen_addrs.add(curr_ea)
+                                results.append({
+                                    "addr": hex(curr_ea),
+                                    "value": str_buf.decode('ascii', errors='ignore'),
+                                    "length": len(str_buf),
+                                    "type": "raw_unicode_scan",
+                                    "func": idc.get_func_name(curr_ea) if ida_funcs.get_func(curr_ea) else None
+                                })
+                                curr_ea = scan_ea
+                                continue
+                    
+                    curr_ea += 1
+        
+        _log(f"String search complete. Found {len(results)} strings.")
+        return {"results": results, "count": len(results), "methods_used": ["ida_builtin", "raw_ascii", "raw_unicode"]}
+    return _safe_read(_impl)
+
+# ==============================================================================
+# >>> NEW: ADVANCED INSTRUCTION DUMPING & DUPLICATION DETECTION <<<
+# ==============================================================================
+
+def dump_function_instructions(address, include_bytes=True, detect_duplicates=True):
+    """
+    Dumps all instructions in a function with detailed metadata.
+    Optionally detects duplicate instruction sequences.
+    """
+    def _impl():
+        _log(f"Dumping instructions for: {address}")
+        ea = _resolve_address(address)
+        if ea == idaapi.BADADDR: return {"_error": "invalid_address"}
+        
+        func = ida_funcs.get_func(ea)
+        if not func: return {"_error": "not_a_function"}
+        
+        instructions = []
+        insn_hashes = {} # For duplicate detection
+        duplicates = []
+        
+        curr_ea = func.start_ea
+        while curr_ea < func.end_ea:
+            if not ida_bytes.is_code(idaapi.get_flags(curr_ea)): # Fixed: was idaapi.isCode
+                curr_ea = idc.NextHead(curr_ea)
+                continue
+                
+            disasm = _get_disasm(curr_ea)
+            size = idc.get_item_size(curr_ea)
+            bytes_raw = _get_bytes(curr_ea, size) if include_bytes else b""
+            
+            # Decode instruction for advanced details
+            insn = ida_ua.insn_t()
+            ida_ua.decode_insn(insn, curr_ea)
+            
+            # Create a hash of the mnemonic + operand types for duplicate detection
+            if detect_duplicates:
+                op_types = tuple([op.type for op in insn.ops if op.type != ida_ua.o_void])
+                sig = f"{insn.itype}_{op_types}"
+                sig_hash = hashlib.md5(sig.encode()).hexdigest()[:8]
+                
+                if sig_hash in insn_hashes:
+                    duplicates.append({
+                        "addr": hex(curr_ea),
+                        "disasm": disasm,
+                        "original_addr": insn_hashes[sig_hash],
+                        "signature": sig
+                    })
+                else:
+                    insn_hashes[sig_hash] = hex(curr_ea)
+
+            instr_entry = {
+                "addr": hex(curr_ea),
+                "disasm": disasm,
+                "mnemonic": ida_ua.print_insn_mnem(curr_ea),
+                "size": size,
+                "itype": insn.itype,
+                "bytes": _hex_bytes(bytes_raw) if include_bytes else None,
+                "operands": []
+            }
+            
+            # Extract operand details
+            for i, op in enumerate(insn.ops):
+                if op.type == ida_ua.o_void: break
+                instr_entry["operands"].append({
+                    "index": i,
+                    "type": op.type,
+                    "text": ida_ua.print_operand(curr_ea, i),
+                    "value": op.value if op.type == ida_ua.o_imm else None,
+                    "addr": hex(op.addr) if op.type in (ida_ua.o_near, ida_ua.o_far, ida_ua.o_mem) else None
+                })
+                
+            instructions.append(instr_entry)
+            curr_ea = idc.NextHead(curr_ea)
+            
+        _log(f"Dumped {len(instructions)} instructions. Found {len(duplicates)} potential duplicates.")
+        return {
+            "function": idc.get_func_name(func.start_ea),
+            "start": hex(func.start_ea),
+            "end": hex(func.end_ea),
+            "instructions": instructions,
+            "instruction_count": len(instructions),
+            "duplicates": duplicates,
+            "duplicate_count": len(duplicates)
+        }
+    return _safe_read(_impl)
+
+# ==============================================================================
+# >>> FUNCTION RENAMING FEATURES <<<
+# ==============================================================================
+
+def rename_function(address, new_name):
+    """Rename a function and optionally demangle/update references"""
+    def _impl():
+        _log(f"Renaming function at {address} to {new_name}")
+        data = {"_source": "rename_function", "_address_input": address, "_new_name": new_name}
+        ea = _resolve_address(address)
+        data["_address_resolved"] = hex(ea) if ea != idaapi.BADADDR else None
+        if ea == idaapi.BADADDR: return {**data, "_error": "address_unresolved"}
+        
+        func = ida_funcs.get_func(ea)
+        if not func: return {**data, "_error": "no_function_at_address"}
+        
+        old_name = idc.get_func_name(ea)
+        # SN_NOWARN | SN_CHECK
+        success = idc.set_name(ea, new_name, idc.SN_NOWARN | idc.SN_CHECK)
+        
+        data["old_name"] = old_name
+        data["new_name"] = new_name if success else None
+        data["success"] = bool(success)
+        
+        if success:
+            # Try to update local types if possible
+            try:
+                if _has_decompiler:
+                    ida_hexrays.rename_func(ea, new_name)
+            except: pass
+            
+        return data
+    return _safe_write(_impl)
+
+def rename_by_pattern(pattern, prefix="sub_", limit=100):
+    """Batch rename functions matching a pattern (e.g., all 'sub_' functions)"""
+    def _impl():
+        _log(f"Batch renaming functions matching '{pattern}'...")
+        data = {"_source": "rename_by_pattern", "_pattern": pattern, "_prefix": prefix, "_limit": limit}
+        renamed = []
+        count = 0
+        for ea in idautils.Functions():
+            if count >= limit: break
+            name = idc.get_func_name(ea)
+            if name and pattern in name:
+                new_name = f"{prefix}{count:04d}"
+                if idc.set_name(ea, new_name, idc.SN_NOWARN | idc.SN_CHECK):
+                    renamed.append({"addr": hex(ea), "old": name, "new": new_name})
+                    count += 1
+        data["renamed"] = renamed
+        data["count"] = len(renamed)
+        return data
+    return _safe_write(_impl)
+
+def set_function_comment(address, comment, repeatable=False):
+    """Set comment for a function"""
+    def _impl():
+        _log(f"Setting comment for function at {address}")
+        data = {"_source": "set_function_comment", "_address_input": address, "_comment": comment}
+        ea = _resolve_address(address)
+        data["_address_resolved"] = hex(ea) if ea != idaapi.BADADDR else None
+        if ea == idaapi.BADADDR: return {**data, "_error": "address_unresolved"}
+        
+        func = ida_funcs.get_func(ea)
+        if not func: return {**data, "_error": "no_function_at_address"}
+        
+        # 0 = regular, 1 = repeatable
+        cmt_type = 1 if repeatable else 0
+        success = idc.set_func_cmt(ea, comment, cmt_type)
+        data["success"] = bool(success)
+        return data
+    return _safe_write(_impl)
+
+# ==============================================================================
+# >>> ADVANCED XREF SCANNING <<<
+# ==============================================================================
+
+def advanced_xref_scan(address, scan_depth=1, include_data=True, include_code=True):
+    """
+    Advanced scanner that recursively follows xrefs and categorizes them.
+    Returns a tree-like structure of references.
+    """
+    def _impl():
+        _log(f"Advanced XREF scan starting at {address} (depth={scan_depth})")
+        data = {"_source": "advanced_xref_scan", "_address_input": address, "_depth": scan_depth}
+        ea = _resolve_address(address)
+        data["_address_resolved"] = hex(ea) if ea != idaapi.BADADDR else None
+        if ea == idaapi.BADADDR: return data
+        
+        visited = set()
+        results = []
+        
+        def _scan_node(curr_ea, depth):
+            if curr_ea in visited or depth > scan_depth: return
+            visited.add(curr_ea)
+            
+            node_info = {
+                "addr": hex(curr_ea),
+                "name": idc.get_name(curr_ea) or idc.get_func_name(curr_ea),
+                "depth": depth,
+                "incoming": [],
+                "outgoing": []
+            }
+            
+            # Scan Incoming
+            if include_code:
+                for ref in idautils.CodeRefsTo(curr_ea, 1):
+                    if ref not in visited:
+                        insn = ida_ua.insn_t()
+                        ida_ua.decode_insn(insn, ref)
+                        node_info["incoming"].append({
+                            "from": hex(ref),
+                            "type": "code_flow" if ida_bytes.is_code(idaapi.get_flags(ref)) else "code_jump",
+                            "mnemonic": ida_ua.print_insn_mnem(ref),
+                            "disasm": _get_disasm(ref)
+                        })
+            
+            if include_data:
+                for ref in idautils.DataRefsTo(curr_ea):
+                    if ref not in visited:
+                        node_info["incoming"].append({
+                            "from": hex(ref),
+                            "type": "data_ref",
+                            "disasm": _get_disasm(ref)
+                        })
+
+            # Scan Outgoing
+            if include_code:
+                for ref in idautils.CodeRefsFrom(curr_ea, 1):
+                     if ref not in visited:
+                        node_info["outgoing"].append({
+                            "to": hex(ref),
+                            "type": "code_flow",
+                            "name": idc.get_name(ref) or idc.get_func_name(ref)
+                        })
+                        
+            if include_data:
+                for ref in idautils.DataRefsFrom(curr_ea):
+                    if ref not in visited:
+                        node_info["outgoing"].append({
+                            "to": hex(ref),
+                            "type": "data_ref",
+                            "name": idc.get_name(ref)
+                        })
+
+            results.append(node_info)
+            
+            # Recurse into outgoing code refs if depth allows
+            if depth < scan_depth:
+                for ref in idautils.CodeRefsFrom(curr_ea, 1):
+                    _scan_node(ref, depth + 1)
+
+        _scan_node(ea, 0)
+        
+        data["scan_tree"] = results
+        data["total_nodes"] = len(results)
+        return data
+    return _safe_read(_impl)
+
+def find_xref_chains(target_address, max_chains=50):
+    """Find complete call chains leading TO a specific target"""
+    def _impl():
+        _log(f"Finding xref chains for target: {target_address}")
+        data = {"_source": "find_xref_chains", "_target": target_address}
+        target_ea = _resolve_address(target_address)
+        data["_target_resolved"] = hex(target_ea) if target_ea != idaapi.BADADDR else None
+        if target_ea == idaapi.BADADDR: return data
+        
+        chains = []
+        # Start from all immediate callers
+        callers = list(idautils.CodeRefsTo(target_ea, 1))
+        
+        for caller_ea in callers[:max_chains]:
+            chain = [hex(target_ea)]
+            curr = caller_ea
+            visited_in_chain = {target_ea, caller_ea}
+            
+            # Walk back up to 5 levels
+            for _ in range(5):
+                func = ida_funcs.get_func(curr)
+                if not func: break
+                
+                # Find who calls this function
+                parents = list(idautils.CodeRefsTo(func.start_ea, 1))
+                if not parents: break
+                
+                # Pick the first parent that isn't in our chain
+                next_parent = None
+                for p in parents:
+                    if p not in visited_in_chain:
+                        next_parent = p
+                        break
+                
+                if next_parent:
+                    chain.append(hex(curr))
+                    visited_in_chain.add(next_parent)
+                    curr = next_parent
+                else:
+                    chain.append(hex(curr))
+                    break
+            
+            chains.append({
+                "root_caller": hex(caller_ea),
+                "chain": list(reversed(chain)), # Reverse so it reads Caller -> ... -> Target
+                "length": len(chain)
+            })
+            
+        data["chains"] = chains
+        data["count"] = len(chains)
+        return data
+    return _safe_read(_impl)
+
+def analyze_operand_xrefs(address, operand_index=0):
+    """Analyze xrefs specifically generated by a certain operand in an instruction"""
+    def _impl():
+        _log(f"Analyzing operand xrefs at {address}")
+        data = {"_source": "analyze_operand_xrefs", "_address_input": address, "_operand_idx": operand_index}
+        ea = _resolve_address(address)
+        data["_address_resolved"] = hex(ea) if ea != idaapi.BADADDR else None
+        if ea == idaapi.BADADDR: return data
+        
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) <= 0:
+            return {**data, "_error": "decode_failed"}
+        
+        op = insn.ops[operand_index]
+        data["operand_type"] = op.type
+        data["operand_text"] = ida_ua.print_operand(ea, operand_index)
+        
+        xrefs = []
+        # If it's an immediate or displacement, it might point to something
+        if op.type in (ida_ua.o_imm, ida_ua.o_displ, ida_ua.o_near, ida_ua.o_far):
+            val = op.value if op.type == ida_ua.o_imm else op.addr
+            if val and idaapi.is_mapped(val): # Fixed: was idaapi.isMapped
+                # Get all xrefs to this value
+                for ref in idautils.XrefsTo(val, 0):
+                    xrefs.append({
+                        "from": hex(ref.frm),
+                        "type": ida_xref.xref_type_name(ref.type),
+                        "disasm": _get_disasm(ref.frm)
+                    })
+        
+        data["value_referenced"] = hex(val) if 'val' in dir() else None
+        data["xrefs_to_value"] = xrefs
+        data["count"] = len(xrefs)
+        return data
+    return _safe_read(_impl)
+
+# ===== EXISTING XREF TOOLS (Kept for compatibility) =====
 def xrefs_to(address):
     def _impl():
+        _log(f"Getting xrefs to {address}")
         data = {"_source": "xrefs_to", "_address_input": address}
         ea = _resolve_address(address)
         data["_address_resolved"] = hex(ea) if ea != idaapi.BADADDR else None
@@ -168,7 +643,7 @@ def xrefs_to(address):
                 "type": ref.type,
                 "type_name": ida_xref.xref_type_name(ref.type) if hasattr(ida_xref, 'xref_type_name') else None,
                 "user": bool(getattr(ref, 'user', False)),
-                "is_code": idaapi.isCode(idaapi.getFlags(ref.frm)) if idaapi.isMapped(ref.frm) else None,
+                "is_code": ida_bytes.is_code(idaapi.get_flags(ref.frm)) if idaapi.is_mapped(ref.frm) else None, # Fixed
                 "from_func": idc.get_func_name(ref.frm) if ida_funcs.get_func(ref.frm) else None,
                 "from_disasm": _get_disasm(ref.frm),
                 "from_bytes": _hex_bytes(_get_bytes(ref.frm, 16)),
@@ -187,6 +662,7 @@ def xrefs_to(address):
 
 def xrefs_from(address):
     def _impl():
+        _log(f"Getting xrefs from {address}")
         data = {"_source": "xrefs_from", "_address_input": address}
         ea = _resolve_address(address)
         data["_address_resolved"] = hex(ea) if ea != idaapi.BADADDR else None
@@ -198,8 +674,8 @@ def xrefs_from(address):
                 "type_name": ida_xref.xref_type_name(ref.type) if hasattr(ida_xref, 'xref_type_name') else None,
                 "user": bool(getattr(ref, 'user', False)),
                 "to_name": idc.get_name(ref.to), "to_func": idc.get_func_name(ref.to) if ida_funcs.get_func(ref.to) else None,
-                "to_mapped": idaapi.isMapped(ref.to),
-                "to_disasm": _get_disasm(ref.to) if idaapi.isMapped(ref.to) else None,
+                "to_mapped": idaapi.is_mapped(ref.to), # Fixed
+                "to_disasm": _get_disasm(ref.to) if idaapi.is_mapped(ref.to) else None,
             })
         data["xrefs"] = xrefs; data["count"] = len(xrefs); data["source"] = hex(ea)
         return data
@@ -261,8 +737,8 @@ def xref_context(address, context_lines=3):
             ctx = []
             cur = max(0, ref.frm - context_lines * 16)
             end = ref.frm + context_lines * 16
-            while cur < end and idaapi.isMapped(cur):
-                ctx.append({"addr": hex(cur), "asm": _get_disasm(cur), "bytes": _hex_bytes(_get_bytes(cur, 16)), "is_code": idaapi.isCode(idaapi.getFlags(cur)), "is_target": cur == ref.frm})
+            while cur < end and idaapi.is_mapped(cur): # Fixed
+                ctx.append({"addr": hex(cur), "asm": _get_disasm(cur), "bytes": _hex_bytes(_get_bytes(cur, 16)), "is_code": ida_bytes.is_code(idaapi.get_flags(cur)), "is_target": cur == ref.frm})
                 cur = idc.NextHead(cur)
                 if cur == idaapi.BADADDR: break
             results.append({"xref_from": hex(ref.frm), "xref_type": ida_xref.xref_type_name(ref.type) if hasattr(ida_xref, 'xref_type_name') else ref.type, "xref_user": bool(getattr(ref, 'user', False)), "context": ctx})
@@ -290,7 +766,7 @@ def function_xrefs(address):
             insn = idaapi.insn_t()
             if idaapi.decode_insn(insn, cur) > 0 and insn.itype == idaapi.NN_call:
                 ta = insn.Op1.addr
-                if ta and idaapi.isMapped(ta):
+                if ta and idaapi.is_mapped(ta): # Fixed
                     callee_f = ida_funcs.get_func(ta)
                     callees.append({"addr": hex(ta), "func_name": idc.get_func_name(ta) if callee_f else None, "call_site": hex(cur), "call_disasm": _get_disasm(cur)})
             cur = idc.NextHead(cur)
@@ -329,7 +805,7 @@ def call_graph(address, depth=2):
                 insn = idaapi.insn_t()
                 if idaapi.decode_insn(insn, cur) > 0 and insn.itype == idaapi.NN_call:
                     ta = insn.Op1.addr
-                    if ta and idaapi.isMapped(ta):
+                    if ta and idaapi.is_mapped(ta): # Fixed
                         tf = ida_funcs.get_func(ta)
                         if tf and tf.start_ea not in seen_callees:
                             seen_callees.add(tf.start_ea)
@@ -391,7 +867,7 @@ def find_xref_path(start_addr, end_addr, max_depth=10):
             if curr == end_ea: path_found = path; break
             if len(path) >= max_depth: continue
             for ref in idautils.XrefsFrom(curr, 0):
-                if ref.to not in visited and idaapi.isMapped(ref.to):
+                if ref.to not in visited and idaapi.is_mapped(ref.to): # Fixed
                     visited.add(ref.to); queue.append((ref.to, path + [ref.to]))
         data["found"] = path_found is not None
         if path_found: data["path"] = [hex(a) for a in path_found]; data["length"] = len(path_found)
@@ -440,7 +916,7 @@ def debug_info():
         if inf:
             try: data["imagebase"] = hex(getattr(inf, 'imagebase', 0))
             except: pass
-            try: data["procname"] = getattr(inf, 'procName', getattr(inf, 'procname', None))
+            try: data["procname"] = getattr(inf, 'procname', None) # Fixed: was procName
             except: pass
         for name, getter in [
             ("functions", lambda: list(idautils.Functions())),
@@ -460,12 +936,12 @@ def get_disasm_full(address, count=100):
     def _impl():
         data = {"_source": "get_disasm_full", "_address_input": address, "_count_requested": count}
         data["_address_resolved"] = hex(ea) if ea != idaapi.BADADDR else None
-        if ea == idaapi.BADADDR or not idaapi.isMapped(ea): return data
+        if ea == idaapi.BADADDR or not idaapi.is_mapped(ea): return data # Fixed
         out = []
         cur = ea
         for i in range(count):
-            if not idaapi.isMapped(cur) or not idaapi.isCode(idaapi.getFlags(cur)): break
-            out.append({"addr": hex(cur), "asm": _get_disasm(cur), "bytes": _hex_bytes(_get_bytes(cur, 32)), "flags": idaapi.getFlags(cur), "is_code": idaapi.isCode(idaapi.getFlags(cur)), "is_data": idaapi.isData(idaapi.getFlags(cur)), "func": idc.get_func_name(cur) if ida_funcs.get_func(cur) else None})
+            if not idaapi.is_mapped(cur) or not ida_bytes.is_code(idaapi.get_flags(cur)): break # Fixed
+            out.append({"addr": hex(cur), "asm": _get_disasm(cur), "bytes": _hex_bytes(_get_bytes(cur, 32)), "flags": idaapi.get_flags(cur), "is_code": ida_bytes.is_code(idaapi.get_flags(cur)), "is_data": ida_bytes.is_data(idaapi.get_flags(cur)), "func": idc.get_func_name(cur) if ida_funcs.get_func(cur) else None})
             cur = idc.NextHead(cur)
             if cur == idaapi.BADADDR: break
         data["instructions"] = out; data["count_returned"] = len(out)
@@ -503,7 +979,7 @@ def search_full(pattern, search_type="bytes"):
         elif search_type == "string":
             for s in idautils.Strings():
                 if pattern.lower() in str(s).lower():
-                    results.append({"addr": hex(s.ea), "string": str(s), "length": s.length, "type": s.type, "func": idc.get_func_name(s.ea) if ida_funcs.get_func(s.ea) else None})
+                    results.append({"addr": hex(s.ea), "string": str(s), "length": s.length, "type": s.strtype, "func": idc.get_func_name(s.ea) if ida_funcs.get_func(s.ea) else None}) # Fixed: s.type -> s.strtype
         data["results"] = results; data["count"] = len(results)
         return data
     return _safe_read(_impl)
@@ -512,6 +988,22 @@ def search_full(pattern, search_type="bytes"):
 TOOL_MAP = {
     "ida_preflight": {"fn": lambda a: preflight(), "schema": {"type": "object", "properties": {}, "required": []}},
     "ida_decompile": {"fn": lambda a: decompile(a.get("address")), "schema": {"type": "object", "properties": {"address": {"type": "string"}}, "required": []}},
+    
+    # --- NEW ADVANCED FEATURES ---
+    "ida_advanced_string_search": {"fn": lambda a: advanced_string_search(a.get("min_len", 4), a.get("search_ascii", True), a.get("search_unicode", True), a.get("search_cstrings", True)), "schema": {"type": "object", "properties": {"min_len": {"type": "integer"}, "search_ascii": {"type": "boolean"}, "search_unicode": {"type": "boolean"}, "search_cstrings": {"type": "boolean"}}, "required": []}},
+    "ida_dump_function_instructions": {"fn": lambda a: dump_function_instructions(a.get("address"), a.get("include_bytes", True), a.get("detect_duplicates", True)), "schema": {"type": "object", "properties": {"address": {"type": "string"}, "include_bytes": {"type": "boolean"}, "detect_duplicates": {"type": "boolean"}}, "required": []}},
+    
+    # --- RENAME TOOLS ---
+    "ida_rename_function": {"fn": lambda a: rename_function(a.get("address"), a.get("new_name")), "schema": {"type": "object", "properties": {"address": {"type": "string"}, "new_name": {"type": "string"}}, "required": []}},
+    "ida_rename_by_pattern": {"fn": lambda a: rename_by_pattern(a.get("pattern"), a.get("prefix", "sub_"), a.get("limit", 100)), "schema": {"type": "object", "properties": {"pattern": {"type": "string"}, "prefix": {"type": "string"}, "limit": {"type": "integer"}}, "required": []}},
+    "ida_set_function_comment": {"fn": lambda a: set_function_comment(a.get("address"), a.get("comment"), a.get("repeatable", False)), "schema": {"type": "object", "properties": {"address": {"type": "string"}, "comment": {"type": "string"}, "repeatable": {"type": "boolean"}}, "required": []}},
+
+    # --- ADVANCED XREF TOOLS ---
+    "ida_advanced_xref_scan": {"fn": lambda a: advanced_xref_scan(a.get("address"), a.get("scan_depth", 1), a.get("include_data", True), a.get("include_code", True)), "schema": {"type": "object", "properties": {"address": {"type": "string"}, "scan_depth": {"type": "integer"}, "include_data": {"type": "boolean"}, "include_code": {"type": "boolean"}}, "required": []}},
+    "ida_find_xref_chains": {"fn": lambda a: find_xref_chains(a.get("target_address"), a.get("max_chains", 50)), "schema": {"type": "object", "properties": {"target_address": {"type": "string"}, "max_chains": {"type": "integer"}}, "required": []}},
+    "ida_analyze_operand_xrefs": {"fn": lambda a: analyze_operand_xrefs(a.get("address"), a.get("operand_index", 0)), "schema": {"type": "object", "properties": {"address": {"type": "string"}, "operand_index": {"type": "integer"}}, "required": []}},
+
+    # --- EXISTING TOOLS ---
     "ida_xrefs_to": {"fn": lambda a: xrefs_to(a.get("address")), "schema": {"type": "object", "properties": {"address": {"type": "string"}}, "required": []}},
     "ida_xrefs_from": {"fn": lambda a: xrefs_from(a.get("address")), "schema": {"type": "object", "properties": {"address": {"type": "string"}}, "required": []}},
     "ida_data_refs": {"fn": lambda a: data_refs(a.get("address")), "schema": {"type": "object", "properties": {"address": {"type": "string"}}, "required": []}},
@@ -541,25 +1033,38 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    def log_message(self, fmt, *args): print(f"[HTTP] {args[0]}", file=sys.stderr)
+    def log_message(self, fmt, *args): 
+        try: idaapi.msg(f"[HTTP] {args[0]}\n")
+        except: print(f"[HTTP] {args[0]}", file=sys.stderr)
+        
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        
     def _json(self, data, status=200):
         body = json.dumps(data, default=str, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
         self._cors(); self.end_headers(); self.wfile.write(body)
-    def do_OPTIONS(self): self.send_response(204); self._cors(); self.end_headers()
+        
+    def do_OPTIONS(self): 
+        self.send_response(204); self._cors(); self.end_headers()
+        
     def do_GET(self):
         path = urlparse(self.path).path
-        if path in ("/mcp", "/", ""): self._json({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "ida-xref-full-mcp", "version": "2.0-full-data"}})
-        elif path == "/health": self._json({"ok": True, "port": PORT, "ptr_size": PTR_SIZE, "tools": len(TOOLS), "decompiler": _has_decompiler, "mode": "full-data-return"})
-        elif path == "/tools": self._json({"tools": TOOLS})
-        elif path == "/debug": self._json(debug_info())
-        else: self._json({"error": "Not found"}, 404)
+        if path in ("/mcp", "/", ""): 
+            self._json({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "ida-ultimate-mcp", "version": "5.0"}})
+        elif path == "/health": 
+            self._json({"ok": True, "port": PORT, "ptr_size": PTR_SIZE, "tools": len(TOOLS), "decompiler": _has_decompiler, "mode": "full-data-return"})
+        elif path == "/tools": 
+            self._json({"tools": TOOLS})
+        elif path == "/debug": 
+            self._json(debug_info())
+        else: 
+            self._json({"error": "Not found"}, 404)
+            
     def do_POST(self):
         if urlparse(self.path).path not in ("/mcp", "/", ""):
             self._json({"error": "Not found"}, 404); return
@@ -567,12 +1072,15 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             req = json.loads(self.rfile.read(length).decode())
         except Exception as e:
-            self._json({"_parse_error": str(e), "_raw_request": self.rfile.read(length).decode()[:500] if length > 0 else None}, 400); return
+            self._json({"_parse_error": str(e)}, 400); return
+            
         req_id, method, params = req.get("id"), req.get("method"), req.get("params", {})
-        print(f"[MCP] {method}", file=sys.stderr)
+        try: idaapi.msg(f"[MCP] {method}\n")
+        except: print(f"[MCP] {method}", file=sys.stderr)
+        
         try:
             if method == "initialize":
-                self._json({"jsonrpc": "2.0", "id": req_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "ida-xref-full-mcp", "version": "2.0-full-data"}}})
+                self._json({"jsonrpc": "2.0", "id": req_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "ida-ultimate-mcp", "version": "5.0"}}})
             elif method == "tools/list":
                 self._json({"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}})
             elif method == "tools/call":
@@ -588,16 +1096,21 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})
         except Exception as e:
-            print(f"[ERR] {e}", file=sys.stderr); traceback.print_exc(file=sys.stderr)
+            try: idaapi.msg(f"[ERR] {e}\n")
+            except: print(f"[ERR] {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             self._json({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps({"_exception": f"{type(e).__name__}: {e}", "_traceback": traceback.format_exc()}, default=str)}]}})
 
 def run_server():
     srv = ThreadedHTTPServer((HOST, PORT), Handler)
-    print(f"[✓] IDA XREF FULL-DATA MCP v2.0: http://{HOST}:{PORT}/mcp", file=sys.stderr)
-    print(f"[✓] Mode: RETURN ALL DATA — no filtering, no truncation", file=sys.stderr)
-    print(f"[✓] Tools: {len(TOOLS)} | Decompiler: {'Yes' if _has_decompiler else 'No'}", file=sys.stderr)
+    try: idaapi.msg(f"[✓] IDA Ultimate MCP v5.0 started on http://{HOST}:{PORT}/mcp\n")
+    except: print(f"[✓] IDA Ultimate MCP v5.0 started on http://{HOST}:{PORT}/mcp", file=sys.stderr)
+    try: idaapi.msg(f"[✓] Tools loaded: {len(TOOLS)} | Decompiler: {_has_decompiler}\n")
+    except: print(f"[✓] Tools loaded: {len(TOOLS)} | Decompiler: {_has_decompiler}", file=sys.stderr)
     srv.serve_forever()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_server, daemon=True); t.start()
-    print(f"[✓] Full-data server started on port {PORT}!", file=sys.stderr)
+    t = threading.Thread(target=run_server, daemon=True)
+    t.start()
+    try: idaapi.msg(f"[✓] Server thread started on port {PORT}!\n")
+    except: print(f"[✓] Server thread started on port {PORT}!", file=sys.stderr)
